@@ -22,6 +22,8 @@ from datetime import date
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.data_source import AxDataSource, StrRef
+from openpyxl.chart.marker import Marker
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -57,6 +59,24 @@ _thin = Side(style="thin", color="CBD5E1")
 BORDER = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
 CNT_FMT = "#,##0"
 PCT_FMT = "0.0%"
+
+
+def _ref(ws, c1, r1, c2, r2) -> str:
+    """A quoted A1-style range string for the given sheet/cells."""
+    a = f"${get_column_letter(c1)}${r1}"
+    b = f"${get_column_letter(c2)}${r2}"
+    return f"'{ws.title}'!{a}:{b}"
+
+
+def _text_categories(chart, ref: str):
+    """Set the chart's category axis from a *text* range.
+
+    openpyxl's set_categories() writes a numeric reference, which Excel cannot
+    read for text labels (they come out blank). Forcing a strRef fixes that.
+    """
+    src = AxDataSource(strRef=StrRef(f=ref))
+    for s in chart.series:
+        s.cat = src
 
 
 def build_report_xlsx(df, bucket: str = "Monthly") -> bytes:
@@ -226,41 +246,46 @@ def _summary_sheet(ws, df, funnel, summ, period):
 
 
 def _charts(ws, statuses, top, last_data_row, conv_col, anchor_row):
-    """Two charts, both sourced from the VISIBLE table so they always render
-    (Excel does not plot hidden cells): funnel-by-channel + conversion-by-channel.
-    Series colours match the table/KPI status colours."""
-    cats = Reference(ws, min_col=1, min_row=top + 1, max_row=last_data_row)
+    """Two charts, sourced from the VISIBLE table (Excel won't plot hidden cells).
+    Channel labels via strRef; funnel uses 100%-stacked so small channels aren't
+    crushed by the highest-volume one."""
+    cat_ref = _ref(ws, 1, top + 1, 1, last_data_row)          # channel names (text)
 
-    # 1) Funnel by channel (stacked). Count columns are visible: 3, 5, 7, ...
+    # 1) Funnel mix by channel (100% stacked → comparable regardless of volume).
     bar = BarChart()
-    bar.type = "bar"; bar.grouping = "stacked"; bar.overlap = 100
-    bar.title = "Funnel by channel"; bar.height = 9.5; bar.width = 24
+    bar.type = "bar"; bar.grouping = "percentStacked"; bar.overlap = 100
+    bar.title = "Funnel mix by channel (share of leads)"
+    bar.height = 9.5; bar.width = 20
     for k, s in enumerate(statuses):
         ref = Reference(ws, min_col=3 + 2 * k, min_row=top, max_row=last_data_row)
         bar.add_data(ref, titles_from_data=True)
-    bar.set_categories(cats)
     for srs, s in zip(bar.series, statuses):
         srs.graphicalProperties.solidFill = STATUS_HEX[s]
         srs.graphicalProperties.line.solidFill = STATUS_HEX[s]
+    _text_categories(bar, cat_ref)
+    bar.x_axis.numFmt = "0%"; bar.x_axis.majorGridlines = None
     bar.legend.position = "b"
     ws.add_chart(bar, f"A{anchor_row}")
 
-    # 2) Conversion % by channel (visible Conversion % column).
+    # 2) Conversion % by channel.
     conv = BarChart()
     conv.type = "col"; conv.title = "Conversion % by channel"
-    conv.height = 8; conv.width = 24
+    conv.height = 8; conv.width = 20
     conv.add_data(Reference(ws, min_col=conv_col, min_row=top, max_row=last_data_row),
                   titles_from_data=True)
-    conv.set_categories(cats)
     conv.series[0].graphicalProperties.solidFill = "4F46E5"
+    _text_categories(conv, cat_ref)
     conv.y_axis.numFmt = "0%"
     conv.y_axis.majorGridlines = None
     conv.legend = None
-    ws.add_chart(conv, f"A{anchor_row + 20}")
+    ws.add_chart(conv, f"A{anchor_row + 19}")
 
 
 # -------------------------------------------------------------------------
-LINE_PALETTE = ["2563EB", "16A34A", "DC2626", "D97706", "7C3AED", "0891B2"]
+# 12 distinct colours + cycling markers so every partner line stays identifiable.
+LINE_PALETTE = ["2563EB", "16A34A", "DC2626", "D97706", "7C3AED", "0891B2",
+                "DB2777", "65A30D", "EA580C", "0D9488", "9333EA", "475569"]
+MARKERS = ["circle", "square", "triangle", "diamond", "x", "plus"]
 
 
 def _period_sheet(ws, pp, bucket, period):
@@ -335,20 +360,22 @@ def _period_sheet(ws, pp, bucket, period):
     ws.column_dimensions[L(total_col)].width = 9
     ws.freeze_panes = "B5"
 
-    # ---- easy trend chart: top partners as lines over time ----
-    n_lines = min(6, len(partners))
+    # ---- trend chart: every partner as its own line (distinct colour + marker) ----
     line = LineChart()
-    line.title = f"Lead trend — top {n_lines} partners"
-    line.height = 9; line.width = 24
+    line.title = "Lead trend by partner"
+    line.height = 11; line.width = 26
     line.y_axis.title = "Leads"
-    for i in range(n_lines):
-        col = 2 + i
-        ref = Reference(ws, min_col=col, min_row=top, max_row=body_last)
+    line.x_axis.delete = False; line.y_axis.delete = False
+    for i in range(len(partners)):
+        ref = Reference(ws, min_col=2 + i, min_row=top, max_row=body_last)
         line.add_data(ref, titles_from_data=True)
-    line.set_categories(Reference(ws, min_col=1, min_row=body_first, max_row=body_last))
+    _text_categories(line, _ref(ws, 1, body_first, 1, body_last))   # period labels (text)
     for i, srs in enumerate(line.series):
-        srs.graphicalProperties.line.solidFill = LINE_PALETTE[i % len(LINE_PALETTE)]
-        srs.graphicalProperties.line.width = 28000   # ~2.2pt
+        colour = LINE_PALETTE[i % len(LINE_PALETTE)]
+        srs.graphicalProperties.line.solidFill = colour
+        srs.graphicalProperties.line.width = 26000   # ~2pt
+        srs.marker = Marker(symbol=MARKERS[i % len(MARKERS)], size=6)
+        srs.marker.graphicalProperties.solidFill = colour
         srs.smooth = False
     line.legend.position = "b"
     ws.add_chart(line, f"A{r + 3}")
@@ -424,9 +451,9 @@ def _reasons_sheet(ws, pivot, funnel, period):
     # A) Top rejection reasons overall (horizontal bar) — uses the Total column.
     rbar = BarChart()
     rbar.type = "bar"; rbar.title = "Top rejection reasons (all partners)"
-    rbar.height = 0.55 * (body_last - body_first + 1) + 2.5; rbar.width = 16
+    rbar.height = 0.55 * (body_last - body_first + 1) + 2.5; rbar.width = 18
     rbar.add_data(Reference(ws, min_col=total_col, min_row=body_first, max_row=body_last))
-    rbar.set_categories(Reference(ws, min_col=1, min_row=body_first, max_row=body_last))
+    _text_categories(rbar, _ref(ws, 1, body_first, 1, body_last))     # reason names (text)
     rbar.series[0].graphicalProperties.solidFill = "DC2626"
     rbar.legend = None
     ws.add_chart(rbar, f"A{grand_total_row + 3}")
@@ -434,10 +461,10 @@ def _reasons_sheet(ws, pivot, funnel, period):
     # B) Total rejections by partner (column) — uses the ALL REASONS total row.
     pbar = BarChart()
     pbar.type = "col"; pbar.title = "Total rejections by partner"
-    pbar.height = 9; pbar.width = 16
+    pbar.height = 9; pbar.width = 18
     data = Reference(ws, min_col=2, max_col=1 + len(channels), min_row=grand_total_row, max_row=grand_total_row)
     pbar.add_data(data, from_rows=True)
-    pbar.set_categories(Reference(ws, min_col=2, max_col=1 + len(channels), min_row=top, max_row=top))
+    _text_categories(pbar, _ref(ws, 2, top, 1 + len(channels), top))   # partner names (text, header row)
     pbar.series[0].graphicalProperties.solidFill = "991B1B"
     pbar.legend = None
-    ws.add_chart(pbar, f"K{grand_total_row + 3}")
+    ws.add_chart(pbar, f"A{grand_total_row + 22}")
