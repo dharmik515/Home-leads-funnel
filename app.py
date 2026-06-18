@@ -72,10 +72,10 @@ def _themed(fig):
 
 
 @st.cache_data(show_spinner="Reading workbook…")
-def _load(file_bytes: bytes):
-    # Cached on the file's *content*, so a new/edited upload always reloads
-    # (even if its name and size happen to match a previous one).
-    return D.load_workbook(file_bytes)
+def _load(file_bytes: bytes, fero_bytes=None):
+    # Cached on the files' *content*, so a new/edited upload always reloads
+    # (even if name and size happen to match a previous one).
+    return D.load_workbook(file_bytes, fero_source=fero_bytes)
 
 
 def _money(v: float) -> str:
@@ -164,21 +164,41 @@ def trend_chart(tr: pd.DataFrame, bucket: str):
 # Sidebar — input & filters
 # =========================================================================
 st.sidebar.title("📊 Home Leads Funnel")
-up = st.sidebar.file_uploader("Upload updated workbook (.xlsx)", type=["xlsx"])
+up = st.sidebar.file_uploader("Home Leads Funnel file (.xlsx)", type=["xlsx"])
+fero_up = st.sidebar.file_uploader(
+    "Optional — Fero appraisal file (.xlsx)", type=["xlsx"], key="fero",
+    help="Adds detailed rejection reasons + appraiser remarks, mapped by Deal ID = Appraisal ID.")
 
 if up is None:
     st.title("Home Leads Funnel — automated dashboard")
     st.info("⬅️ Upload a **Home Leads Funnel** workbook to begin. "
-            "It should contain one sheet per channel (the same layout as the source file).")
+            "Optionally add the **Fero** appraisal file to enrich rejection reasons.")
     st.stop()
 
+fero_bytes = fero_up.getvalue() if fero_up is not None else None
 try:
-    df_all = _load(up.getvalue())
+    df_all = _load(up.getvalue(), fero_bytes)
 except Exception as e:
-    st.error(f"Could not read **{up.name}**: {e}")
-    st.stop()
+    if fero_bytes is not None:
+        # Fero is optional — never let it block the funnel dashboard.
+        st.sidebar.warning(f"Couldn't apply the Fero file ({e}). Showing funnel data only.")
+        try:
+            df_all = _load(up.getvalue(), None)
+        except Exception as e2:
+            st.error(f"Could not read **{up.name}**: {e2}")
+            st.stop()
+    else:
+        st.error(f"Could not read **{up.name}**: {e}")
+        st.stop()
 
 st.sidebar.caption(f"Loaded: **{up.name}** — {len(df_all):,} deals · {df_all['Channel'].nunique()} channels")
+_fs = D.fero_stats(df_all)
+if _fs["applied"]:
+    st.sidebar.success(
+        f"🔗 Fero linked: {_fs['matched']:,} deals · "
+        f"{_fs['reasons']:,} reasons · {_fs['remarks']:,} remarks")
+elif fero_up is not None:
+    st.sidebar.warning("Fero file read, but no Deal ID ↔ Appraisal ID matches were found.")
 
 # Filters
 channels = sorted(df_all["Channel"].unique())
@@ -237,6 +257,9 @@ st.dataframe(
 st.plotly_chart(channel_bar(summ), use_container_width=True)
 
 st.subheader("Why leads drop off & what's being traded")
+if _fs["applied"]:
+    st.caption(f"Rejection reasons sourced from the Fero appraisal file "
+               f"({_fs['reasons']:,} of {len(df):,} deals matched by Deal ID = Appraisal ID).")
 b1, b2, b3 = st.columns(3)
 rr = D.reject_reasons(df, 10)
 if not rr.empty:
@@ -260,6 +283,36 @@ if not brand.empty:
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10),
                       title="Top brands", yaxis_title=None)
     b3.plotly_chart(_themed(fig), use_container_width=True)
+
+# Rejection reasons by partner (heatmap with totals) + cleaned per-device table
+rpivot = D.reject_pivot(df, top=8)
+rdetail = D.rejection_detail(df)
+if not rpivot.empty:
+    st.markdown("##### Rejection reasons by partner")
+    src = "the **Fero** file" if _fs["applied"] else "the funnel file"
+    grand = int(rpivot.loc["ALL REASONS", "Total"]) if "ALL REASONS" in rpivot.index else int(rpivot["Total"].sum())
+    st.caption(f"Source: {src} (matched by Deal ID = Appraisal ID). "
+               f"Total rejections with a reason: **{grand:,}**. "
+               f"Totals per reason/partner are shown in the labels.")
+    inner = (rpivot.drop(index=["ALL REASONS"], errors="ignore")
+                   .drop(columns=["Total"], errors="ignore"))
+    reason_tot = rpivot.drop(index=["ALL REASONS"], errors="ignore")["Total"]
+    partner_tot = (rpivot.loc["ALL REASONS"].drop("Total")
+                   if "ALL REASONS" in rpivot.index else inner.sum())
+    # Append totals to the axis labels so they show without skewing the colour scale.
+    inner.index = [f"{r}  ({int(reason_tot.get(r, 0)):,})" for r in inner.index]
+    inner.columns = [f"{c} ({int(partner_tot.get(c, 0)):,})" for c in inner.columns]
+    fig = px.imshow(
+        inner, labels=dict(x="Partner (total)", y="Reason (total)", color="Rejections"),
+        color_continuous_scale="Reds", aspect="auto", text_auto=True,
+    )
+    fig.update_layout(height=min(140 + 40 * len(inner), 600),
+                      margin=dict(l=10, r=10, t=20, b=10),
+                      coloraxis_showscale=False, xaxis_side="top")
+    fig.update_xaxes(tickangle=-35)
+    st.plotly_chart(_themed(fig), use_container_width=True)
+    with st.expander(f"Rejection reasons by device ({len(rdetail):,} rejected deals)"):
+        st.dataframe(rdetail, width="stretch", hide_index=True, height=320)
 
 # Downloads & detail
 st.divider()

@@ -73,11 +73,12 @@ def _clean_channel(sheet_name: str) -> str:
     return CHANNEL_RENAME.get(name, name)
 
 
-def load_workbook(source) -> pd.DataFrame:
-    """Read all channel sheets from `source` (path, bytes, or file-like) into one tidy DataFrame.
+def load_workbook(source, fero_source=None) -> pd.DataFrame:
+    """Read the Home Leads Funnel `source` (path, bytes, or file-like) into one tidy DataFrame.
 
-    Returns a DataFrame with everything normalised plus helper columns:
-      Channel, _date, _deal_value, _initial_value, _final_value, _regrade, Status.
+    Works for both layouts: one channel per sheet, OR a single flat sheet where the
+    channel lives in the `Store Name` column. If `fero_source` is given, the deals are
+    enriched with Fero's rejection reason + appraisal remark (see apply_fero).
     """
     if isinstance(source, (bytes, bytearray)):
         source = io.BytesIO(source)
@@ -91,7 +92,14 @@ def load_workbook(source) -> pd.DataFrame:
             # Not a deal sheet (Summary, notes, blank tab, ...) -- skip.
             skipped.append(sheet)
             continue
-        raw["Channel"] = _clean_channel(sheet)
+        # Channel = Store Name column (authoritative; works for the flat file too),
+        # falling back to the sheet name where Store Name is blank.
+        fallback = _clean_channel(sheet)
+        if "Store Name" in raw.columns:
+            sn = raw["Store Name"].fillna("").astype(str).str.strip()
+            raw["Channel"] = sn.where(sn.ne("") & sn.str.lower().ne("nan"), fallback)
+        else:
+            raw["Channel"] = fallback
         frames.append(raw)
 
     if not frames:
@@ -100,8 +108,51 @@ def load_workbook(source) -> pd.DataFrame:
             f"both {sorted(REQUIRED_COLUMNS)} columns. Sheets seen: {list(xl.sheet_names)}."
         )
 
-    df = pd.concat(frames, ignore_index=True)
-    return _normalise(df)
+    df = _normalise(pd.concat(frames, ignore_index=True))
+    if fero_source is not None:
+        df = apply_fero(df, fero_source)
+    return df
+
+
+def apply_fero(df: pd.DataFrame, fero_source) -> pd.DataFrame:
+    """Overlay Fero appraisal data onto the funnel deals.
+
+    Joins Fero `Appraisal ID` to the funnel `Deal ID` and brings over ONLY the
+    rejection reason and appraisal remark. Fero's reason becomes the primary
+    rejection reason (the funnel's own is the fallback where there's no match).
+    Adds helper columns: _fero_reason, _fero_remark, _fero_matched.
+    """
+    if isinstance(fero_source, (bytes, bytearray)):
+        fero_source = io.BytesIO(fero_source)
+    fero = pd.read_excel(fero_source, dtype=str)
+    fero.columns = [str(c).strip() for c in fero.columns]
+    if "Appraisal ID" not in fero.columns:
+        raise ValueError(
+            "Fero file must contain an 'Appraisal ID' column to map to the funnel's "
+            f"Deal ID. Columns seen: {list(fero.columns)[:10]}..."
+        )
+
+    def cl(series):
+        # normalise text (Fero values contain non-breaking spaces)
+        return series.fillna("").astype(str).str.replace("\xa0", " ", regex=False).str.strip()
+
+    fero["_aid"] = cl(fero["Appraisal ID"])
+    fero["_reason"] = cl(fero["Reason"]) if "Reason" in fero.columns else ""
+    fero["_remark"] = cl(fero["Appraisal Remarks"]) if "Appraisal Remarks" in fero.columns else ""
+    # One row per appraisal id; prefer the row that actually has a reason.
+    fero = fero[fero["_aid"] != ""].sort_values("_reason", key=lambda s: s.eq(""))
+    fmap = fero.drop_duplicates("_aid").set_index("_aid")
+
+    key = (df["Deal ID"].fillna("").astype(str).str.strip()
+           if "Deal ID" in df.columns else pd.Series("", index=df.index))
+    df["_fero_reason"] = key.map(fmap["_reason"]).fillna("")
+    df["_fero_remark"] = key.map(fmap["_remark"]).fillna("")
+    df["_fero_matched"] = key.ne("") & key.isin(fmap.index)
+
+    # Rejection reason comes ONLY from Fero (matched by Deal ID = Appraisal ID).
+    # (When no Fero file is supplied, the funnel's own reason set in _normalise stands.)
+    df["_reject_reason"] = df["_fero_reason"].replace("", pd.NA)
+    return df
 
 
 def _normalise(df: pd.DataFrame) -> pd.DataFrame:
@@ -143,6 +194,11 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
             df["_reject_reason"] = df["_reject_reason"].fillna(df[c])
     else:
         df["_reject_reason"] = np.nan
+
+    # --- Fero enrichment placeholders (filled by apply_fero if a Fero file is given) ---
+    df["_fero_reason"] = ""
+    df["_fero_remark"] = ""
+    df["_fero_matched"] = False
 
     # --- canonical funnel status ---
     df["Status"] = df.apply(_derive_status, axis=1)
@@ -290,6 +346,45 @@ def reject_pivot(df: pd.DataFrame, top: int = 8) -> pd.DataFrame:
     total_row.name = "ALL REASONS"
     piv = pd.concat([piv, total_row.to_frame().T])
     return piv.astype(int)
+
+
+def rejection_detail(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-device rejection reasons (Channel, Status, Reason) for rejected deals
+    that have a reason recorded."""
+    r = df[df["Status"] == "Rejected"].copy()
+    r["Reason"] = (r["_reject_reason"].fillna("").astype(str)
+                   .str.replace("\xa0", " ", regex=False).str.strip())
+    r = r[r["Reason"] != ""]
+    if r.empty:
+        return pd.DataFrame(columns=["Channel", "Status", "Reason"])
+    return r[["Channel", "Status", "Reason"]].reset_index(drop=True)
+
+
+def appraisal_remarks(df: pd.DataFrame) -> pd.DataFrame:
+    """Deals that carry an appraiser remark from Fero (free-text notes)."""
+    if "_fero_remark" not in df.columns:
+        return pd.DataFrame(columns=["Deal ID", "Channel", "Status", "Reason", "Remark"])
+    rem = df["_fero_remark"].fillna("").astype(str).str.strip()
+    sub = df[rem != ""].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["Deal ID", "Channel", "Status", "Reason", "Remark"])
+    out = pd.DataFrame({
+        "Deal ID": sub.get("Deal ID", pd.Series("", index=sub.index)).astype(str),
+        "Channel": sub["Channel"],
+        "Status": sub["Status"],
+        "Reason": sub["_fero_reason"].replace("", "—"),
+        "Remark": sub["_fero_remark"],
+    })
+    return out.reset_index(drop=True)
+
+
+def fero_stats(df: pd.DataFrame) -> dict:
+    """Summary of how much Fero enrichment was applied."""
+    matched = bool(df.get("_fero_matched", pd.Series(dtype=bool)).any())
+    n_match = int(df["_fero_matched"].sum()) if "_fero_matched" in df else 0
+    n_reason = int((df.get("_fero_reason", pd.Series([], dtype=str)).fillna("") != "").sum())
+    n_remark = int((df.get("_fero_remark", pd.Series([], dtype=str)).fillna("") != "").sum())
+    return {"applied": matched, "matched": n_match, "reasons": n_reason, "remarks": n_remark}
 
 
 def breakdown(df: pd.DataFrame, col: str, top: int = 10) -> pd.DataFrame:

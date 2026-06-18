@@ -85,6 +85,20 @@ def _text_categories(chart, ref: str):
     chart.y_axis.delete = False
 
 
+def _value_labels(num_fmt: str | None = None) -> DataLabelList:
+    """Data labels that show ONLY the value (not the noisy series/category name)."""
+    dl = DataLabelList()
+    dl.showVal = True
+    dl.showSerName = False
+    dl.showCatName = False
+    dl.showLegendKey = False
+    dl.showPercent = False
+    dl.showBubbleSize = False
+    if num_fmt:
+        dl.numFmt = num_fmt
+    return dl
+
+
 def build_report_xlsx(df, bucket: str = "Monthly") -> bytes:
     funnel = D.funnel_counts(df)
     summ = D.channel_summary(df)
@@ -98,10 +112,37 @@ def build_report_xlsx(df, bucket: str = "Monthly") -> bytes:
     _summary_sheet(wb.active, df, funnel, summ, period)
     _period_sheet(wb.create_sheet("By Period"), ppartner, bucket, period)
     _reasons_sheet(wb.create_sheet("Rejection Reasons"), rpivot, funnel, period)
+    remarks = D.appraisal_remarks(df)
+    if not remarks.empty:
+        _remarks_sheet(wb.create_sheet("Appraiser Remarks"), remarks, period)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _remarks_sheet(ws, remarks, period):
+    """Free-text appraiser remarks from Fero, one row per device."""
+    _dated_header(ws, "Appraiser Remarks (from Fero)", period)
+    headers = ["Deal ID", "Channel", "Status", "Reason", "Remark"]
+    widths = [22, 22, 12, 34, 50]
+    top = 4
+    for j, h in enumerate(headers, 1):
+        cell = ws.cell(row=top, column=j, value=h)
+        cell.font = HEADER_FONT; cell.alignment = LEFT if j in (1, 4, 5) else CENTER
+        cell.border = BORDER; cell.fill = HEADER_FILL
+    r = top
+    for _, row in remarks.iterrows():
+        r += 1
+        for j, h in enumerate(headers, 1):
+            cell = ws.cell(row=r, column=j, value=str(row[h]))
+            cell.border = BORDER
+            cell.alignment = LEFT if j in (1, 4, 5) else CENTER
+            if (r - top) % 2 == 0:
+                cell.fill = BAND_FILL
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = f"A{top+1}"
 
 
 # -------------------------------------------------------------------------
@@ -269,23 +310,22 @@ def _charts(ws, statuses, top, last_data_row, conv_col, anchor_row):
         srs.graphicalProperties.solidFill = STATUS_HEX[s]
         srs.graphicalProperties.line.solidFill = STATUS_HEX[s]
     _text_categories(bar, cat_ref)
-    bar.x_axis.numFmt = "0%"; bar.x_axis.majorGridlines = None
+    bar.y_axis.numFmt = "0%"               # value axis = share of leads
     bar.legend.position = "b"
     ws.add_chart(bar, f"A{anchor_row}")
 
-    # 2) Conversion % by channel.
+    # 2) Conversion % by channel — horizontal so channel names sit on the left.
     conv = BarChart()
-    conv.type = "col"; conv.title = "Conversion % by channel"
-    conv.height = 8; conv.width = 20
+    conv.type = "bar"; conv.title = "Conversion % by channel"
+    conv.height = 9.5; conv.width = 20
     conv.add_data(Reference(ws, min_col=conv_col, min_row=top, max_row=last_data_row),
                   titles_from_data=True)
     conv.series[0].graphicalProperties.solidFill = "4F46E5"
     _text_categories(conv, cat_ref)
     conv.y_axis.numFmt = "0%"
-    conv.y_axis.majorGridlines = None
-    conv.dataLabels = DataLabelList(); conv.dataLabels.showVal = True; conv.dataLabels.numFmt = "0%"
+    conv.dataLabels = _value_labels("0%")
     conv.legend = None
-    ws.add_chart(conv, f"A{anchor_row + 19}")
+    ws.add_chart(conv, f"A{anchor_row + 21}")
 
 
 # -------------------------------------------------------------------------
@@ -394,12 +434,11 @@ def _reasons_sheet(ws, pivot, funnel, period):
         ws["A4"] = "No rejections with a recorded reason in this selection."
         ws["A4"].font = SUB_FONT
         return
-
+    top = 4
     channels = [c for c in pivot.columns if c != "Total"]
     reasons = list(pivot.index)                 # includes 'ALL REASONS' total row last
     ncol = 1 + len(channels) + 1                # Reason | channels... | Total
     total_col = ncol
-    top = 4
 
     # ---- header (reason | rotated channel names | total) ----
     h = ws.cell(row=top, column=1, value="Rejection reason")
@@ -457,23 +496,23 @@ def _reasons_sheet(ws, pivot, funnel, period):
     # ---- two simple, single-message charts (easier to read than a stack) ----
     # A) Top rejection reasons overall (horizontal bar) — uses the Total column.
     rbar = BarChart()
-    rbar.type = "bar"; rbar.title = "Top rejection reasons (all partners)"
+    rbar.type = "bar"; rbar.title = "Top rejection reasons (all partners) — Source: Fero"
     rbar.height = 0.55 * (body_last - body_first + 1) + 2.5; rbar.width = 18
     rbar.add_data(Reference(ws, min_col=total_col, min_row=body_first, max_row=body_last))
     _text_categories(rbar, _ref(ws, 1, body_first, 1, body_last))     # reason names (text)
     rbar.series[0].graphicalProperties.solidFill = "DC2626"
-    rbar.dataLabels = DataLabelList(); rbar.dataLabels.showVal = True
+    rbar.dataLabels = _value_labels()
     rbar.legend = None
     ws.add_chart(rbar, f"A{grand_total_row + 3}")
 
-    # B) Total rejections by partner (column) — uses the ALL REASONS total row.
+    # B) Total rejections by partner (horizontal — partner names on the left).
     pbar = BarChart()
-    pbar.type = "col"; pbar.title = "Total rejections by partner"
+    pbar.type = "bar"; pbar.title = "Total rejections by partner — Source: Home Funnel"
     pbar.height = 9; pbar.width = 18
     data = Reference(ws, min_col=2, max_col=1 + len(channels), min_row=grand_total_row, max_row=grand_total_row)
     pbar.add_data(data, from_rows=True)
     _text_categories(pbar, _ref(ws, 2, top, 1 + len(channels), top))   # partner names (text, header row)
     pbar.series[0].graphicalProperties.solidFill = "991B1B"
-    pbar.dataLabels = DataLabelList(); pbar.dataLabels.showVal = True
+    pbar.dataLabels = _value_labels()
     pbar.legend = None
     ws.add_chart(pbar, f"A{grand_total_row + 22}")
