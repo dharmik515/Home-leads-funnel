@@ -224,16 +224,17 @@ st.plotly_chart(trend_chart(D.trend(df, bucket), bucket), use_container_width=Tr
 
 st.subheader("By channel")
 summ = D.channel_summary(df)
-cc1, cc2 = st.columns([1.1, 1])
-cc1.plotly_chart(channel_bar(summ), use_container_width=True)
 disp = summ.rename(columns={"Done": "Deals Done"})
 for col in ["Total Leads", "Deals Done", "Rejected", "Pending", "Awaiting Confirmation"]:
     disp[col] = disp[col].astype(int)
-cc2.dataframe(
+# Table first, full width — height sized to show every row without an inner scroll.
+st.dataframe(
     disp.style.format({"Conversion %": "{:.1f}%"})
         .background_gradient(subset=["Conversion %"], cmap="RdYlGn", vmin=0, vmax=100),
-    width="stretch", height=460, hide_index=True,
+    width="stretch", height=(len(disp) + 1) * 35 + 3, hide_index=True,
 )
+# Chart below, full width.
+st.plotly_chart(channel_bar(summ), use_container_width=True)
 
 st.subheader("Why leads drop off & what's being traded")
 b1, b2, b3 = st.columns(3)
