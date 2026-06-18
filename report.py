@@ -23,6 +23,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.data_source import AxDataSource, StrRef
+from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.marker import Marker
 from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -69,14 +70,19 @@ def _ref(ws, c1, r1, c2, r2) -> str:
 
 
 def _text_categories(chart, ref: str):
-    """Set the chart's category axis from a *text* range.
+    """Set the chart's category axis from a *text* range and make axes visible.
 
-    openpyxl's set_categories() writes a numeric reference, which Excel cannot
-    read for text labels (they come out blank). Forcing a strRef fixes that.
+    Two openpyxl gotchas fixed here:
+    1. set_categories() writes a numeric reference, which Excel can't read for
+       text labels (they render blank) -> force a strRef.
+    2. Chart axes default to delete=True, so Excel hides the axis labels
+       entirely -> force both axes visible.
     """
     src = AxDataSource(strRef=StrRef(f=ref))
     for s in chart.series:
         s.cat = src
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
 
 
 def build_report_xlsx(df, bucket: str = "Monthly") -> bytes:
@@ -277,6 +283,7 @@ def _charts(ws, statuses, top, last_data_row, conv_col, anchor_row):
     _text_categories(conv, cat_ref)
     conv.y_axis.numFmt = "0%"
     conv.y_axis.majorGridlines = None
+    conv.dataLabels = DataLabelList(); conv.dataLabels.showVal = True; conv.dataLabels.numFmt = "0%"
     conv.legend = None
     ws.add_chart(conv, f"A{anchor_row + 19}")
 
@@ -377,7 +384,7 @@ def _period_sheet(ws, pp, bucket, period):
         srs.marker = Marker(symbol=MARKERS[i % len(MARKERS)], size=6)
         srs.marker.graphicalProperties.solidFill = colour
         srs.smooth = False
-    line.legend.position = "b"
+    line.legend.position = "r"          # right side: doesn't collide with date labels
     ws.add_chart(line, f"A{r + 3}")
 
 
@@ -455,6 +462,7 @@ def _reasons_sheet(ws, pivot, funnel, period):
     rbar.add_data(Reference(ws, min_col=total_col, min_row=body_first, max_row=body_last))
     _text_categories(rbar, _ref(ws, 1, body_first, 1, body_last))     # reason names (text)
     rbar.series[0].graphicalProperties.solidFill = "DC2626"
+    rbar.dataLabels = DataLabelList(); rbar.dataLabels.showVal = True
     rbar.legend = None
     ws.add_chart(rbar, f"A{grand_total_row + 3}")
 
@@ -466,5 +474,6 @@ def _reasons_sheet(ws, pivot, funnel, period):
     pbar.add_data(data, from_rows=True)
     _text_categories(pbar, _ref(ws, 2, top, 1 + len(channels), top))   # partner names (text, header row)
     pbar.series[0].graphicalProperties.solidFill = "991B1B"
+    pbar.dataLabels = DataLabelList(); pbar.dataLabels.showVal = True
     pbar.legend = None
     ws.add_chart(pbar, f"A{grand_total_row + 22}")
