@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
+
+# Data / generated outputs — never commit customer data or reports
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+sample_report.xlsx
